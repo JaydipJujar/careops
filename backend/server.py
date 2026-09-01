@@ -14,6 +14,7 @@ import bcrypt
 import jwt
 import asyncio
 import resend
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 #from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 ROOT_DIR = Path(__file__).parent
@@ -27,6 +28,14 @@ db = client[os.environ['DB_NAME']]
 # Resend setup
 resend.api_key = os.environ.get('RESEND_API_KEY')
 SENDER_EMAIL = os.environ.get('SENDER_EMAIL', 'onboarding@resend.dev')
+
+# Used to build links inside emails (public booking/contact/form-fill pages)
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+
+# Reminder windows (hours) - how far ahead of a booking to send a reminder,
+# and how long a form stays pending before we nudge the customer again.
+BOOKING_REMINDER_HOURS_AHEAD = float(os.environ.get('BOOKING_REMINDER_HOURS_AHEAD', 24))
+FORM_REMINDER_AFTER_HOURS = float(os.environ.get('FORM_REMINDER_AFTER_HOURS', 24))
 
 # JWT setup
 JWT_SECRET = os.environ.get('JWT_SECRET')
@@ -45,6 +54,12 @@ class UserRole(str):
     OWNER = "owner"
     STAFF = "staff"
 
+# Modules a staff member's access can be scoped to. Owners always have full access.
+STAFF_PERMISSION_MODULES = ["inbox", "bookings", "forms", "inventory"]
+
+def default_staff_permissions() -> Dict[str, bool]:
+    return {module: True for module in STAFF_PERMISSION_MODULES}
+
 class User(BaseModel):
     model_config = ConfigDict(extra="ignore")
     user_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -52,6 +67,9 @@ class User(BaseModel):
     password_hash: str
     role: str
     workspace_id: Optional[str] = None
+    # Only meaningful for staff; owners are never restricted by this.
+    permissions: Dict[str, bool] = Field(default_factory=default_staff_permissions)
+    is_active: bool = True
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 class UserRegister(BaseModel):
@@ -62,6 +80,20 @@ class UserRegister(BaseModel):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+
+class StaffInvite(BaseModel):
+    email: EmailStr
+    password: str
+    permissions: Optional[Dict[str, bool]] = None
+
+class StaffPermissionsUpdate(BaseModel):
+    permissions: Dict[str, bool]
+
+class WorkspaceUpdate(BaseModel):
+    business_name: Optional[str] = None
+    address: Optional[str] = None
+    timezone: Optional[str] = None
+    contact_email: Optional[EmailStr] = None
 
 class TokenResponse(BaseModel):
     token: str
@@ -163,6 +195,7 @@ class Booking(BaseModel):
     service_id: str
     scheduled_at: str
     status: str = "confirmed"
+    reminder_sent: bool = False
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 class BookingCreate(BaseModel):
@@ -183,16 +216,29 @@ class FormTemplate(BaseModel):
     description: Optional[str] = None
     fields: List[Dict[str, Any]]
     linked_service_ids: List[str] = []
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+class FormCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    fields: List[Dict[str, Any]]
+    linked_service_ids: List[str] = []
 
 class FormSubmission(BaseModel):
     model_config = ConfigDict(extra="ignore")
     submission_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    workspace_id: str
     form_id: str
     booking_id: Optional[str] = None
     contact_id: str
-    data: Dict[str, Any]
+    data: Dict[str, Any] = {}
     status: str = "pending"
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    last_reminded_at: Optional[str] = None
     submitted_at: Optional[str] = None
+
+class FormSubmissionSubmit(BaseModel):
+    data: Dict[str, Any]
 
 class InventoryItem(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -250,9 +296,32 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except Exception as e:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+def require_permission(module: str):
+    """
+    Dependency factory: owners always pass. Staff must have the named module
+    enabled in their permissions map. Use on routes that MODIFY workspace data
+    (creating/editing bookings, replying to conversations, managing forms or
+    inventory) - not on read-only routes, which stay open to any workspace user.
+    """
+    async def checker(current_user: dict = Depends(get_current_user)):
+        if current_user["role"] == "owner":
+            return current_user
+        if current_user["role"] == "staff":
+            permissions = current_user.get("permissions") or {}
+            if permissions.get(module, False):
+                return current_user
+        raise HTTPException(status_code=403, detail=f"You don't have access to {module}")
+    return checker
+
+async def require_owner(current_user: dict = Depends(get_current_user)):
+    """Configuration, automation rules, and integrations are owner-only per spec."""
+    if current_user["role"] != "owner":
+        raise HTTPException(status_code=403, detail="Only the business owner can do this")
+    return current_user
+
 # ============= EMAIL HELPER =============
 
-async def send_email_async(to_email: str, subject: str, html_content: str):
+async def send_email_async(to_email: str, subject: str, html_content: str, workspace_id: Optional[str] = None):
     try:
         params = {
             "from": SENDER_EMAIL,
@@ -265,6 +334,15 @@ async def send_email_async(to_email: str, subject: str, html_content: str):
         return result
     except Exception as e:
         logger.error(f"Failed to send email: {str(e)}")
+        if workspace_id:
+            alert = Alert(
+                workspace_id=workspace_id,
+                type="integration_failure",
+                title="Email delivery failed",
+                message=f"Could not send email to {to_email}: {str(e)}",
+                severity="critical"
+            )
+            await db.alerts.insert_one(alert.model_dump())
         return None
 
 # ============= ROUTES =============
@@ -334,7 +412,7 @@ async def get_workspace(current_user: dict = Depends(get_current_user)):
     return workspace
 
 @api_router.put("/workspace/onboarding")
-async def update_onboarding_step(step: int, current_user: dict = Depends(get_current_user)):
+async def update_onboarding_step(step: int, current_user: dict = Depends(require_owner)):
     workspace_id = current_user.get("workspace_id")
     await db.workspaces.update_one(
         {"workspace_id": workspace_id},
@@ -342,17 +420,103 @@ async def update_onboarding_step(step: int, current_user: dict = Depends(get_cur
     )
     return {"status": "success"}
 
-@api_router.post("/workspace/activate")
-async def activate_workspace(current_user: dict = Depends(get_current_user)):
+@api_router.put("/workspace")
+async def update_workspace(data: WorkspaceUpdate, current_user: dict = Depends(require_owner)):
     workspace_id = current_user.get("workspace_id")
+    updates = {k: v for k, v in data.model_dump().items() if v is not None}
+    if updates:
+        await db.workspaces.update_one({"workspace_id": workspace_id}, {"$set": updates})
+    workspace = await db.workspaces.find_one({"workspace_id": workspace_id}, {"_id": 0})
+    return workspace
+
+@api_router.post("/workspace/activate")
+async def activate_workspace(current_user: dict = Depends(require_owner)):
+    workspace_id = current_user.get("workspace_id")
+
+    # Spec: before activation, verify a communication channel is connected,
+    # at least one booking type exists, and availability is defined.
+    integrations = await db.integration_settings.find_one({"workspace_id": workspace_id}, {"_id": 0})
+    has_channel = bool(integrations and (integrations.get("email_enabled") or integrations.get("sms_enabled")))
+    service_count = await db.services.count_documents({"workspace_id": workspace_id, "is_active": True})
+    availability_count = await db.availability.count_documents({"workspace_id": workspace_id})
+
+    missing = []
+    if not has_channel:
+        missing.append("Connect at least one communication channel (email or SMS)")
+    if service_count == 0:
+        missing.append("Create at least one service/booking type")
+    if availability_count == 0:
+        missing.append("Define your availability")
+
+    if missing:
+        raise HTTPException(status_code=400, detail={"message": "Workspace is not ready to activate", "missing": missing})
+
     await db.workspaces.update_one(
         {"workspace_id": workspace_id},
         {"$set": {"is_active": True}}
     )
     return {"status": "success"}
 
+@api_router.post("/staff/invite")
+async def invite_staff(data: StaffInvite, current_user: dict = Depends(require_owner)):
+    workspace_id = current_user.get("workspace_id")
+    if not workspace_id:
+        raise HTTPException(status_code=400, detail="Create a workspace before adding staff")
+
+    existing = await db.users.find_one({"email": data.email}, {"_id": 0})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    permissions = data.permissions if data.permissions is not None else default_staff_permissions()
+    staff = User(
+        email=data.email,
+        password_hash=hash_password(data.password),
+        role="staff",
+        workspace_id=workspace_id,
+        permissions=permissions
+    )
+    await db.users.insert_one(staff.model_dump())
+
+    workspace = await db.workspaces.find_one({"workspace_id": workspace_id}, {"_id": 0})
+    business_name = workspace["business_name"] if workspace else "CareOps"
+    await send_email_async(
+        data.email,
+        f"You've been invited to {business_name} on CareOps",
+        f"<h2>Welcome to the team!</h2><p>You've been added as staff for <strong>{business_name}</strong>.</p>"
+        f"<p>Sign in at <a href=\"{FRONTEND_URL}/auth\">{FRONTEND_URL}/auth</a> with the email and password your owner shared with you.</p>",
+        workspace_id=workspace_id
+    )
+
+    return {"user_id": staff.user_id, "email": staff.email, "role": staff.role, "permissions": staff.permissions}
+
+@api_router.get("/staff")
+async def list_staff(current_user: dict = Depends(require_owner)):
+    workspace_id = current_user.get("workspace_id")
+    staff = await db.users.find(
+        {"workspace_id": workspace_id, "role": "staff"},
+        {"_id": 0, "password_hash": 0}
+    ).to_list(1000)
+    return staff
+
+@api_router.put("/staff/{user_id}/permissions")
+async def update_staff_permissions(user_id: str, data: StaffPermissionsUpdate, current_user: dict = Depends(require_owner)):
+    workspace_id = current_user.get("workspace_id")
+    staff = await db.users.find_one({"user_id": user_id, "workspace_id": workspace_id, "role": "staff"}, {"_id": 0})
+    if not staff:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+    await db.users.update_one({"user_id": user_id}, {"$set": {"permissions": data.permissions}})
+    return {"status": "success"}
+
+@api_router.delete("/staff/{user_id}")
+async def remove_staff(user_id: str, current_user: dict = Depends(require_owner)):
+    workspace_id = current_user.get("workspace_id")
+    result = await db.users.delete_one({"user_id": user_id, "workspace_id": workspace_id, "role": "staff"})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+    return {"status": "success"}
+
 @api_router.post("/integrations")
-async def setup_integrations(email_enabled: bool, sms_enabled: bool, current_user: dict = Depends(get_current_user)):
+async def setup_integrations(email_enabled: bool, sms_enabled: bool, current_user: dict = Depends(require_owner)):
     workspace_id = current_user.get("workspace_id")
     settings = IntegrationSettings(
         workspace_id=workspace_id,
@@ -396,7 +560,8 @@ async def create_public_contact(workspace_id: str, data: ContactCreate):
         await send_email_async(
             data.email,
             "Welcome!",
-            f"<h2>Hello {data.name}!</h2><p>Thank you for reaching out. We'll get back to you shortly.</p>"
+            f"<h2>Hello {data.name}!</h2><p>Thank you for reaching out. We'll get back to you shortly.</p>",
+            workspace_id=workspace_id
         )
     
     return {"status": "success", "contact_id": contact.contact_id}
@@ -422,7 +587,7 @@ async def get_messages(conversation_id: str, current_user: dict = Depends(get_cu
     return messages
 
 @api_router.post("/conversations/{conversation_id}/reply")
-async def reply_to_conversation(conversation_id: str, content: str, current_user: dict = Depends(get_current_user)):
+async def reply_to_conversation(conversation_id: str, content: str, current_user: dict = Depends(require_permission("inbox"))):
     message = Message(
         conversation_id=conversation_id,
         sender_type="staff",
@@ -437,7 +602,7 @@ async def reply_to_conversation(conversation_id: str, content: str, current_user
     return {"status": "success"}
 
 @api_router.post("/services", response_model=ServiceType)
-async def create_service(data: ServiceCreate, current_user: dict = Depends(get_current_user)):
+async def create_service(data: ServiceCreate, current_user: dict = Depends(require_owner)):
     workspace_id = current_user.get("workspace_id")
     service = ServiceType(
         workspace_id=workspace_id,
@@ -455,7 +620,7 @@ async def get_services(workspace_id: Optional[str] = None, current_user: dict = 
     return services
 
 @api_router.post("/availability", response_model=Availability)
-async def create_availability(data: AvailabilityCreate, current_user: dict = Depends(get_current_user)):
+async def create_availability(data: AvailabilityCreate, current_user: dict = Depends(require_owner)):
     workspace_id = current_user.get("workspace_id")
     availability = Availability(
         workspace_id=workspace_id,
@@ -471,6 +636,36 @@ async def get_availability(workspace_id: Optional[str] = None, current_user: dic
     ws_id = workspace_id or current_user.get("workspace_id")
     availability = await db.availability.find({"workspace_id": ws_id}, {"_id": 0}).to_list(1000)
     return availability
+
+async def send_linked_forms_for_booking(workspace_id: str, booking: "Booking", contact: "Contact"):
+    """
+    Step 5 of the spec: when a booking is created for a service, any form
+    templates linked to that service are sent to the customer automatically.
+    Creates a pending FormSubmission per linked form and emails the fill-in link.
+    """
+    forms = await db.forms.find(
+        {"workspace_id": workspace_id, "linked_service_ids": booking.service_id},
+        {"_id": 0}
+    ).to_list(1000)
+
+    for form in forms:
+        submission = FormSubmission(
+            workspace_id=workspace_id,
+            form_id=form["form_id"],
+            booking_id=booking.booking_id,
+            contact_id=contact.contact_id
+        )
+        await db.form_submissions.insert_one(submission.model_dump())
+
+        if contact.email:
+            fill_link = f"{FRONTEND_URL}/public/forms/{submission.submission_id}"
+            await send_email_async(
+                contact.email,
+                f"Please complete: {form['name']}",
+                f"<h2>One more step</h2><p>Please fill out <strong>{form['name']}</strong> before your appointment:</p>"
+                f"<p><a href=\"{fill_link}\">{fill_link}</a></p>",
+                workspace_id=workspace_id
+            )
 
 @api_router.post("/bookings/public")
 async def create_public_booking(workspace_id: str, data: BookingCreate):
@@ -495,8 +690,11 @@ async def create_public_booking(workspace_id: str, data: BookingCreate):
         await send_email_async(
             data.contact_email,
             "Booking Confirmed",
-            f"<h2>Booking Confirmed!</h2><p>Your booking for {data.scheduled_at} has been confirmed.</p>"
+            f"<h2>Booking Confirmed!</h2><p>Your booking for {data.scheduled_at} has been confirmed.</p>",
+            workspace_id=workspace_id
         )
+
+    await send_linked_forms_for_booking(workspace_id, booking, contact)
     
     return {"status": "success", "booking_id": booking.booking_id}
 
@@ -512,21 +710,22 @@ async def get_bookings(current_user: dict = Depends(get_current_user)):
     return bookings
 
 @api_router.put("/bookings/{booking_id}")
-async def update_booking(booking_id: str, data: BookingUpdate, current_user: dict = Depends(get_current_user)):
+async def update_booking(booking_id: str, data: BookingUpdate, current_user: dict = Depends(require_permission("bookings"))):
     await db.bookings.update_one(
         {"booking_id": booking_id},
         {"$set": {"status": data.status}}
     )
     return {"status": "success"}
 
-@api_router.post("/forms")
-async def create_form(name: str, description: str, fields: List[Dict[str, Any]], current_user: dict = Depends(get_current_user)):
+@api_router.post("/forms", response_model=FormTemplate)
+async def create_form(data: FormCreate, current_user: dict = Depends(require_permission("forms"))):
     workspace_id = current_user.get("workspace_id")
     form = FormTemplate(
         workspace_id=workspace_id,
-        name=name,
-        description=description,
-        fields=fields
+        name=data.name,
+        description=data.description,
+        fields=data.fields,
+        linked_service_ids=data.linked_service_ids
     )
     await db.forms.insert_one(form.model_dump())
     return form
@@ -540,11 +739,46 @@ async def get_forms(current_user: dict = Depends(get_current_user)):
 @api_router.get("/forms/submissions")
 async def get_form_submissions(current_user: dict = Depends(get_current_user)):
     workspace_id = current_user.get("workspace_id")
-    submissions = await db.form_submissions.find({}, {"_id": 0}).to_list(1000)
+    submissions = await db.form_submissions.find({"workspace_id": workspace_id}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    for sub in submissions:
+        form = await db.forms.find_one({"form_id": sub["form_id"]}, {"_id": 0})
+        contact = await db.contacts.find_one({"contact_id": sub["contact_id"]}, {"_id": 0})
+        sub["form"] = form
+        sub["contact"] = contact
     return submissions
 
+# ----- Public, no-auth form fill-in flow (customer side, Step 5 of onboarding) -----
+
+@api_router.get("/forms/public/{submission_id}")
+async def get_public_form_submission(submission_id: str):
+    submission = await db.form_submissions.find_one({"submission_id": submission_id}, {"_id": 0})
+    if not submission:
+        raise HTTPException(status_code=404, detail="Form link not found")
+    form = await db.forms.find_one({"form_id": submission["form_id"]}, {"_id": 0})
+    if not form:
+        raise HTTPException(status_code=404, detail="Form not found")
+    return {"submission": submission, "form": form}
+
+@api_router.post("/forms/public/{submission_id}/submit")
+async def submit_public_form(submission_id: str, data: FormSubmissionSubmit):
+    submission = await db.form_submissions.find_one({"submission_id": submission_id}, {"_id": 0})
+    if not submission:
+        raise HTTPException(status_code=404, detail="Form link not found")
+    if submission["status"] == "completed":
+        raise HTTPException(status_code=400, detail="This form was already submitted")
+
+    await db.form_submissions.update_one(
+        {"submission_id": submission_id},
+        {"$set": {
+            "data": data.data,
+            "status": "completed",
+            "submitted_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    return {"status": "success"}
+
 @api_router.post("/inventory", response_model=InventoryItem)
-async def create_inventory(data: InventoryCreate, current_user: dict = Depends(get_current_user)):
+async def create_inventory(data: InventoryCreate, current_user: dict = Depends(require_permission("inventory"))):
     workspace_id = current_user.get("workspace_id")
     item = InventoryItem(
         workspace_id=workspace_id,
@@ -574,7 +808,7 @@ async def get_inventory(current_user: dict = Depends(get_current_user)):
     return items
 
 @api_router.put("/inventory/{item_id}")
-async def update_inventory(item_id: str, quantity: int, current_user: dict = Depends(get_current_user)):
+async def update_inventory(item_id: str, quantity: int, current_user: dict = Depends(require_permission("inventory"))):
     workspace_id = current_user.get("workspace_id")
     await db.inventory.update_one(
         {"item_id": item_id},
@@ -674,6 +908,81 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
+# ============= AUTOMATION: SCHEDULED REMINDERS =============
+# Event-based automation is handled inline at creation time (welcome message,
+# booking confirmation, inventory alerts). These two jobs cover the two rules
+# from the spec that are time-based rather than event-based: a reminder before
+# an upcoming booking, and a nudge for a form that's still pending.
+
+async def send_booking_reminders():
+    now = datetime.now(timezone.utc)
+    window_end = now + timedelta(hours=BOOKING_REMINDER_HOURS_AHEAD)
+    upcoming = await db.bookings.find({
+        "status": "confirmed",
+        "reminder_sent": False
+    }, {"_id": 0}).to_list(1000)
+
+    for booking in upcoming:
+        try:
+            scheduled_at = datetime.fromisoformat(booking["scheduled_at"])
+            if scheduled_at.tzinfo is None:
+                scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+        except (ValueError, KeyError):
+            continue
+
+        if now < scheduled_at <= window_end:
+            contact = await db.contacts.find_one({"contact_id": booking["contact_id"]}, {"_id": 0})
+            if contact and contact.get("email"):
+                await send_email_async(
+                    contact["email"],
+                    "Reminder: Upcoming appointment",
+                    f"<h2>See you soon!</h2><p>This is a reminder of your appointment on {booking['scheduled_at']}.</p>",
+                    workspace_id=booking["workspace_id"]
+                )
+            await db.bookings.update_one(
+                {"booking_id": booking["booking_id"]},
+                {"$set": {"reminder_sent": True}}
+            )
+
+async def send_pending_form_reminders():
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=FORM_REMINDER_AFTER_HOURS)
+    pending = await db.form_submissions.find({"status": "pending"}, {"_id": 0}).to_list(1000)
+
+    for submission in pending:
+        created_at = datetime.fromisoformat(submission["created_at"])
+        last_reminded = submission.get("last_reminded_at")
+        last_reminded_at = datetime.fromisoformat(last_reminded) if last_reminded else None
+
+        due_for_reminder = created_at <= cutoff and (last_reminded_at is None or last_reminded_at <= cutoff)
+        if not due_for_reminder:
+            continue
+
+        contact = await db.contacts.find_one({"contact_id": submission["contact_id"]}, {"_id": 0})
+        form = await db.forms.find_one({"form_id": submission["form_id"]}, {"_id": 0})
+        if contact and contact.get("email") and form:
+            fill_link = f"{FRONTEND_URL}/public/forms/{submission['submission_id']}"
+            await send_email_async(
+                contact["email"],
+                f"Reminder: please complete {form['name']}",
+                f"<h2>Still pending</h2><p>We're still waiting on <strong>{form['name']}</strong>.</p>"
+                f"<p><a href=\"{fill_link}\">{fill_link}</a></p>",
+                workspace_id=submission["workspace_id"]
+            )
+        await db.form_submissions.update_one(
+            {"submission_id": submission["submission_id"]},
+            {"$set": {"last_reminded_at": now.isoformat()}}
+        )
+
+scheduler = AsyncIOScheduler()
+
+@app.on_event("startup")
+async def start_scheduler():
+    scheduler.add_job(send_booking_reminders, "interval", minutes=15, id="booking_reminders")
+    scheduler.add_job(send_pending_form_reminders, "interval", minutes=60, id="form_reminders")
+    scheduler.start()
+
 @app.on_event("shutdown")
 async def shutdown_db_client():
+    scheduler.shutdown(wait=False)
     client.close()

@@ -15,6 +15,7 @@ import InventoryPage from './pages/InventoryPage';
 import SettingsPage from './pages/SettingsPage';
 import PublicContactForm from './pages/PublicContactForm';
 import PublicBookingPage from './pages/PublicBookingPage';
+import PublicFormFillPage from './pages/PublicFormFillPage';
 
 const ProtectedRoute = ({ children }) => {
   const { user, loading } = useAuth();
@@ -84,6 +85,7 @@ const AppRoutes = () => {
       {/* Public routes */}
       <Route path="/public/contact/:workspaceId" element={<PublicContactForm />} />
       <Route path="/public/booking/:workspaceId" element={<PublicBookingPage />} />
+      <Route path="/public/forms/:submissionId" element={<PublicFormFillPage />} />
       
       <Route path="/" element={<Navigate to="/dashboard" replace />} />
     </Routes>
